@@ -1,0 +1,256 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function getUserRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+    
+    function isFieldManager() {
+      return isAuthenticated() && getUserRole() == 'fieldmanager';
+    }
+    
+    function isEngineer() {
+      return isAuthenticated() && getUserRole() == 'projectengineer';
+    }
+    
+    function isOwner() {
+      return isAuthenticated() && getUserRole() == 'ownerclient';
+    }
+    
+    function isPurchaseManager() {
+      return isAuthenticated() && getUserRole() == 'purchasemanager';
+    }
+    
+    function isProjectMember(projectId) {
+      let project = get(/databases/$(database)/documents/projects/$(projectId)).data;
+      return isProjectMemberData(project);
+    }
+
+    function isProjectMemberData(project) {
+      return request.auth.uid == project.engineerId 
+          || request.auth.uid == project.ownerId 
+          || request.auth.uid == project.managerId
+          || request.auth.uid == project.purchaseManagerId
+          || request.auth.uid == project.ownerUid 
+          || request.auth.uid == project.managerUid
+          || request.auth.uid == project.purchaseManagerUid;
+    }
+    
+    // Users collection
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Projects collection
+    match /projects/{projectId} {
+      allow read: if isAuthenticated() && isProjectMemberData(resource.data);
+      allow create: if isAuthenticated() && isEngineer();
+      allow update: if isAuthenticated() && (
+        isEngineer() || 
+        (isOwner() && (request.auth.uid == resource.data.ownerId || request.auth.uid == resource.data.ownerUid)) ||
+        (isFieldManager() && (request.auth.uid == resource.data.managerId || request.auth.uid == resource.data.managerUid))
+      );
+    }
+    
+    // Material Requests - Top-level collection
+    match /material_requests/{mrId} {
+      // Field Manager can create MR
+      allow create: if isAuthenticated() 
+        && isFieldManager()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.status == 'REQUESTED'
+        && request.resource.data.engineerApproved == false
+        && request.resource.data.ownerApproved == false
+        && isProjectMember(request.resource.data.projectId);
+      
+      // Field Manager can read their own MRs
+      // Engineer can read MRs for approval
+      // Owner can read MRs for financial approval
+      // Purchase Manager can read owner-approved MRs
+      allow read: if isAuthenticated() && (
+        (resource.data.createdBy == request.auth.uid) ||
+        (resource.data.projectId != null && isProjectMember(resource.data.projectId))
+      );
+      
+      // Engineer can approve/reject MR (REQUESTED → ENGINEER_APPROVED or REJECTED)
+      allow update: if isAuthenticated() 
+        && isEngineer()
+        && isProjectMember(resource.data.projectId)
+        && resource.data.status == 'REQUESTED'
+        && (
+          (request.resource.data.status == 'ENGINEER_APPROVED' 
+            && request.resource.data.engineerApproved == true
+            && request.resource.data.engineerApprovedBy == request.auth.uid) ||
+          (request.resource.data.status == 'REJECTED'
+            && request.resource.data.engineerRemarks != null)
+        );
+      
+      // Owner can approve/reject MR (ENGINEER_APPROVED → OWNER_APPROVED or REJECTED)
+      allow update: if isAuthenticated() 
+        && isOwner()
+        && isProjectMember(resource.data.projectId)
+        && resource.data.status == 'ENGINEER_APPROVED'
+        && (
+          (request.resource.data.status == 'OWNER_APPROVED'
+            && request.resource.data.ownerApproved == true
+            && request.resource.data.ownerApprovedBy == request.auth.uid) ||
+          (request.resource.data.status == 'REJECTED'
+            && request.resource.data.ownerRemarks != null)
+        );
+      
+      // System can update status when PO is created (via Purchase Manager)
+      allow update: if isAuthenticated()
+        && isPurchaseManager()
+        && isProjectMember(resource.data.projectId)
+        && resource.data.status == 'OWNER_APPROVED'
+        && request.resource.data.status == 'PO_CREATED';
+    }
+    
+    // Purchase Orders - Top-level collection
+    match /purchase_orders/{poId} {
+      // Purchase Manager can create PO (only after Owner approval)
+      allow create: if isAuthenticated() 
+        && isPurchaseManager()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.status == 'PO_CREATED'
+        && isProjectMember(request.resource.data.projectId)
+        && get(/databases/$(database)/documents/material_requests/$(request.resource.data.mrId)).data.status == 'OWNER_APPROVED';
+      
+      // All project members can read POs
+      allow read: if isAuthenticated() && (
+        (resource.data.createdBy == request.auth.uid) ||
+        (resource.data.projectId != null && isProjectMember(resource.data.projectId))
+      );
+      
+      // System can update PO status when GRN is created (via Field Manager)
+      allow update: if isAuthenticated()
+        && isFieldManager()
+        && isProjectMember(resource.data.projectId)
+        && resource.data.status == 'PO_CREATED'
+        && request.resource.data.status == 'GRN_CONFIRMED';
+    }
+    
+    // Goods Receipt Notes (GRN) - Top-level collection
+    match /grn/{grnId} {
+      // Field Manager can create GRN (confirms delivery)
+      allow create: if isAuthenticated() 
+        && isFieldManager()
+        && request.resource.data.verifiedBy == request.auth.uid
+        && request.resource.data.status == 'GRN_CONFIRMED'
+        && isProjectMember(request.resource.data.projectId)
+        && get(/databases/$(database)/documents/purchase_orders/$(request.resource.data.poId)).data.status == 'PO_CREATED';
+      
+      // All project members can read GRNs
+      allow read: if isAuthenticated() && isProjectMember(resource.data.projectId);
+    }
+    
+    // GST Bills - Top-level collection (unified structure)
+    match /gst_bills/{billId} {
+      // Purchase Manager or Field Manager can create bills (only after GRN if PO linked)
+      allow create: if isAuthenticated() 
+        && (isPurchaseManager() || isFieldManager())
+        && request.resource.data.createdBy == request.auth.uid
+        && isProjectMember(request.resource.data.projectId)
+        && (
+          // Allow bills without GRN (manual/legacy bills)
+          request.resource.data.grnId == null ||
+          // Or validate GRN exists and is confirmed
+          get(/databases/$(database)/documents/grn/$(request.resource.data.grnId)).data.status == 'GRN_CONFIRMED'
+        );
+      
+      // Purchase Manager or Field Manager can update only pending bills
+      allow update: if isAuthenticated()
+        && (isPurchaseManager() || isFieldManager())
+        && resource.data.createdBy == request.auth.uid
+        && resource.data.approvalStatus == 'pending';
+      
+      // Engineer or Owner can approve/reject bills
+      allow update: if isAuthenticated()
+        && (isEngineer() || isOwner())
+        && isProjectMember(resource.data.projectId)
+        && resource.data.approvalStatus == 'pending'
+        && (
+          (request.resource.data.approvalStatus == 'approved'
+            && request.resource.data.approvedBy == request.auth.uid) ||
+          (request.resource.data.approvalStatus == 'rejected'
+            && (request.resource.data.rejectionRemarks != null || request.resource.data.ownerRemarks != null))
+        );
+      
+      // All project members can read bills
+      allow read: if isAuthenticated() && isProjectMember(resource.data.projectId);
+    }
+    
+    // Legacy Bill Collections - Kept for reference but restricted
+    match /projects/{projectId}/gst_bills/{billId} {
+      allow read, write: if false; 
+    }
+    
+    match /bills/{billId} {
+      allow read, write: if false;
+    }
+    
+    // DPRs - Subcollection under projects
+    match /projects/{projectId}/dprs/{dprId} {
+      allow read: if isAuthenticated() && isProjectMember(projectId);
+      allow create: if isAuthenticated() && isFieldManager() && isProjectMember(projectId);
+      allow update: if isAuthenticated() && isEngineer() && isProjectMember(projectId);
+    }
+    
+    // Materials - Subcollection under projects (legacy)
+    match /projects/{projectId}/materials/{materialId} {
+      allow read: if isAuthenticated() && isProjectMember(projectId);
+      allow create: if isAuthenticated() && isFieldManager() && isProjectMember(projectId);
+      allow update: if isAuthenticated() && (isEngineer() || isFieldManager()) && isProjectMember(projectId);
+      allow delete: if isAuthenticated() && isFieldManager() && isProjectMember(projectId);
+    }
+    
+    // Attendance - Subcollection under projects
+    // Path: projects/{projectId}/attendance/{attendanceId}
+    //
+    // Role-based access:
+    // - Field Manager: Create & Mark (read/write) - if assigned to project
+    // - Engineer: View only (read) - if assigned to project
+    // - Owner: View only (read) - if assigned to project
+    // - Purchase Manager: No Access
+    //
+    // Security: Uses isProjectMember() which validates user is assigned to the project
+    match /projects/{projectId}/attendance/{attendanceId} {
+      // Read access for Field Manager, Engineer, Owner (NOT Purchase Manager)
+      allow read: if isAuthenticated() 
+        && !isPurchaseManager()
+        && isProjectMember(projectId);
+      
+      // Create access: Only Field Manager can create attendance
+      // Validates:
+      // 1. User is authenticated
+      // 2. User role is Field Manager
+      // 3. User is assigned to the project
+      // 4. recordedBy matches current user
+      allow create: if isAuthenticated() 
+        && isFieldManager()
+        && isProjectMember(projectId)
+        && request.resource.data.recordedBy == request.auth.uid;
+      
+      // Update access: Only Field Manager who created the record can update
+      allow update: if isAuthenticated() 
+        && isFieldManager()
+        && isProjectMember(projectId)
+        && resource.data.recordedBy == request.auth.uid;
+      
+      // Delete: Disabled - attendance records should not be deleted
+      allow delete: if false;
+    }
+    
+    // Default deny all other collections
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
